@@ -25,12 +25,16 @@ ERC--1400/
 ├── README.md              # Project README
 ├── contracts/             # Solidity smart contracts
 │   ├── ERC1400.sol        # Main security token contract
-│   ├── IERC1400.sol       # ERC-1400 interface (aggregates sub-interfaces)
-│   ├── IERC1410.sol       # Partially Fungible Token interface
-│   ├── IERC1594.sol       # Core Security Token interface
-│   ├── IERC1643.sol       # Document Management interface
-│   ├── IERC1644.sol       # Controller Operations interface
-│   ├── extensions/        # Optional extensions (whitelist, KYC, vesting)
+│   ├── interfaces/        # ERC-1400 interfaces
+│   │   ├── IERC1400.sol   # Aggregated interface (extends IERC20 + IERC1643)
+│   │   ├── IERC1410.sol   # Partially Fungible Token interface
+│   │   ├── IERC1594.sol   # Core Security Token interface
+│   │   ├── IERC1643.sol   # Document Management interface
+│   │   └── IERC1644.sol   # Controller Operations interface
+│   ├── extensions/        # Optional extensions
+│   │   ├── Whitelistable.sol        # KYC/AML address allowlist
+│   │   ├── TransferRestrictor.sol   # Pluggable restriction logic
+│   │   └── CertificateValidator.sol # ECDSA off-chain cert validation
 │   └── mocks/             # Test helper contracts
 ├── test/                  # Test files (Hardhat/Foundry)
 ├── scripts/               # Deployment and operational scripts
@@ -49,9 +53,18 @@ ERC--1400/
 
 Tokens are divided into **partitions** (also called tranches). Each partition is identified by a `bytes32` key and represents a distinct class of tokens (e.g., `locked`, `vested`, `classA`, `classB`). A holder's total balance is the sum of their balances across all partitions.
 
+Common real-world partition uses:
+- `LOCKED` / `UNLOCKED` — vesting or lock-up periods
+- `CLASS_A` / `CLASS_B` — different share classes with distinct voting rights
+- Domestic / international investor tranches — different regulatory holding periods
+
+The **default partition** is typically `bytes32(0)`. The ERC-20 `transfer` function operates on the default partition.
+
 ```solidity
 function balanceOfByPartition(bytes32 partition, address holder) external view returns (uint256);
+function partitionsOf(address holder) external view returns (bytes32[] memory);
 function transferByPartition(bytes32 partition, address to, uint256 value, bytes calldata data) external returns (bytes32);
+function operatorTransferByPartition(bytes32 partition, address from, address to, uint256 value, bytes calldata data, bytes calldata operatorData) external returns (bytes32);
 ```
 
 ### Transfer Restrictions
@@ -63,19 +76,39 @@ function canTransfer(address to, uint256 value, bytes calldata data) external vi
 function canTransferByPartition(bytes32 partition, address to, uint256 value, bytes calldata data) external view returns (bytes1 statusCode, bytes32 reasonCode, bytes32 destinationPartition);
 ```
 
-Common ESC codes:
+Common ESC codes (ERC-1066, `0x5_` range):
+- `0x50` — Transfer failure (generic)
 - `0x51` — Transfer success
-- `0x50` — Transfer failure
 - `0x52` — Insufficient balance
 - `0x53` — Insufficient allowance
 - `0x54` — Transfers halted (paused)
 - `0x55` — Funds locked (lockup period)
 - `0x56` — Invalid sender
 - `0x57` — Invalid receiver
+- `0x58` — Invalid operator
+
+### Certificate-Based Transfer Validation
+
+The `bytes calldata data` parameter in transfer functions supports **off-chain certificate injection** — the primary mechanism for keeping sensitive KYC data off-chain:
+
+1. An off-chain compliance server validates transfer parameters against KYC/AML databases
+2. It signs a certificate encoding `(functionSelector, parameters, expiryDate, nonce)`
+3. The token holder submits the signed certificate as `data` in the transfer call
+4. The on-chain contract uses `ecrecover` (via OpenZeppelin's `ECDSA` library) to verify the certificate signer is an authorized compliance role
+
+This pattern avoids storing PII on-chain while providing cryptographic proof of compliance.
 
 ### Controller Operations
 
-A designated controller address (typically a multisig or governance contract) can force-transfer or force-redeem tokens. This is necessary for legal compliance scenarios. Controller operations emit distinct events and should be used sparingly.
+A designated controller address (typically a multisig or governance contract) can force-transfer or force-redeem tokens. This is necessary for legal compliance scenarios (court orders, asset recovery, regulatory seizure). Controller operations emit distinct events and should be used sparingly.
+
+```solidity
+function isControllable() external view returns (bool);
+function controllerTransfer(address from, address to, uint256 value, bytes calldata data, bytes calldata operatorData) external;
+function controllerRedeem(address tokenHolder, uint256 value, bytes calldata data, bytes calldata operatorData) external;
+```
+
+**Security:** The controller must never be an EOA — use a multisig (e.g., Gnosis Safe). Consider timelocks on controller actions. `isControllable()` returning `false` is irreversible by convention.
 
 ### Document Management
 
@@ -84,7 +117,50 @@ The contract can store references to off-chain documents (legal agreements, pros
 ```solidity
 function setDocument(bytes32 name, string calldata uri, bytes32 documentHash) external;
 function getDocument(bytes32 name) external view returns (string memory uri, bytes32 documentHash, uint256 timestamp);
+function removeDocument(bytes32 name) external;
+function getAllDocuments() external view returns (bytes32[] memory);
 ```
+
+Typical documents: offering memorandum, transfer restriction legend, shareholder agreement. Actual files live off-chain (IPFS or HTTPS); when a document changes, updating the `documentHash` on-chain creates an immutable audit trail.
+
+---
+
+### Typical Contract Architecture
+
+```solidity
+contract ERC1400 is IERC1400, ERC20, Ownable, Pausable, ReentrancyGuard, AccessControl {
+    // Roles
+    bytes32 public constant ISSUER_ROLE = keccak256("ISSUER_ROLE");
+    bytes32 public constant CONTROLLER_ROLE = keccak256("CONTROLLER_ROLE");
+
+    // Default partition
+    bytes32 public constant DEFAULT_PARTITION = bytes32(0);
+
+    // Partition storage
+    mapping(address => bytes32[]) internal _partitionsOf;
+    mapping(bytes32 => mapping(address => uint256)) internal _balanceOfByPartition;
+    bytes32[] internal _totalPartitions;
+    mapping(bytes32 => uint256) internal _totalSupplyByPartition;
+
+    // Document storage (ERC-1643)
+    mapping(bytes32 => Document) internal _documents;
+    bytes32[] internal _documentNames;
+
+    // Flags
+    bool internal _isControllable;
+    bool internal _isIssuable;
+}
+```
+
+### Key Invariants
+
+These invariants **must** hold at all times. Breaking them is a critical bug:
+
+1. `balanceOf(holder) == Σ balanceOfByPartition(p, holder)` for all `p` in `partitionsOf(holder)`
+2. `totalSupply() == Σ _totalSupplyByPartition[p]` for all `p` in `_totalPartitions`
+3. No transfer path (including operator transfers) bypasses `canTransfer` validation — only controller operations are exempt, and they emit `ControllerTransfer` instead of `Transfer`
+4. Partitions with zero balance should be removed from `partitionsOf` to keep the array clean
+5. `isIssuable()` returning `false` is irreversible — once issuance is closed, it cannot be re-opened
 
 ---
 
@@ -183,6 +259,7 @@ ERC-1400 contracts handle regulated financial instruments. Keep these principles
 6. **Access control** — issuance, redemption, and controller operations must be restricted to authorized roles
 7. **Upgrade safety** — if using proxy patterns (UUPS/Transparent), ensure storage layout compatibility
 8. **Audit** — all contracts should be professionally audited before mainnet deployment
+9. **Static analysis** — run Slither or Mythril before any deployment to catch common vulnerabilities
 
 ---
 
@@ -190,9 +267,10 @@ ERC-1400 contracts handle regulated financial instruments. Keep these principles
 
 When developing, refer to these established implementations:
 
-- **ConsenSys/UniversalToken** — The canonical ERC-1400 reference implementation (formerly `ConsenSys/ERC1400`). Uses a certificate-based transfer validation approach.
-- **Polymath SecurityTokenStandard** — Production-grade security token platform built on ERC-1400 concepts.
-- **OpenZeppelin Contracts** — Base contracts for ERC-20, access control, pausability, and reentrancy guards.
+- **ConsenSys/UniversalToken** (`github.com/Consensys/UniversalToken`) — The canonical ERC-1400 reference implementation. Uses certificate-based transfer validation and ERC-1820 interface hooks. Archived March 2025 — reference only, not actively maintained. License: Apache-2.0.
+- **taurushq-io/UniversalTokenERC1400** (`github.com/taurushq-io/UniversalTokenERC1400`) — Hardhat-compatible fork of ConsenSys UniversalToken. Solidity 0.8.7, OpenZeppelin 4.7.3. Note: OpenZeppelin must be pinned at 4.7.3 (4.8.x+ has breaking interface changes when used with this codebase).
+- **SecurityTokenStandard/EIP-Spec** (`github.com/SecurityTokenStandard/EIP-Spec`) — Canonical specification repository with EIP markdown docs and reference Solidity interfaces.
+- **OpenZeppelin Contracts** — Base contracts for ERC-20, AccessControl, Pausable, ReentrancyGuard, ECDSA, and EIP712.
 
 ---
 
