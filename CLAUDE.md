@@ -23,27 +23,37 @@ ERC--1400/
 ├── README.md                  # Project readme
 ├── contracts/
 │   ├── ERC1400.sol            # Main token — aggregates all sub-standards
-│   ├── IERC1400.sol           # Combined interface
-│   ├── partition/
-│   │   ├── ERC1410.sol        # Partially fungible token (partitions)
-│   │   └── IERC1410.sol
-│   ├── core/
-│   │   ├── ERC1594.sol        # Core security token logic
-│   │   └── IERC1594.sol
-│   ├── document/
-│   │   ├── ERC1643.sol        # Document management
-│   │   └── IERC1643.sol
-│   ├── controller/
-│   │   ├── ERC1644.sol        # Controller operations
-│   │   └── IERC1644.sol
-│   ├── extensions/            # Optional extensions (whitelist, lockup, vesting)
+│   ├── interfaces/
+│   │   ├── IERC1400.sol       # Combined umbrella interface (extends IERC20, IERC1643)
+│   │   ├── IERC1410.sol       # Partition interface
+│   │   ├── IERC1594.sol       # Core security token interface
+│   │   ├── IERC1643.sol       # Document management interface
+│   │   └── IERC1644.sol       # Controller operations interface
+│   ├── token/
+│   │   ├── ERC1400Raw.sol     # Base layer: certificates, controllers, hooks, migration
+│   │   ├── ERC1400Partition.sol # Partition layer on top of Raw
+│   │   └── ERC1400ERC20.sol   # ERC-20 backwards compatibility shim
+│   ├── extensions/
+│   │   ├── ERC1400TokensValidator.sol  # Allowlist, blocklist, pause, certificate validation
+│   │   ├── ERC1400TokensChecker.sol    # Read-only canTransfer logic
+│   │   └── ERC1400HoldableToken.sol    # Delivery-vs-payment hold escrow (optional)
+│   ├── roles/
+│   │   ├── MinterRole.sol             # Minter access control
+│   │   ├── CertificateSignerRole.sol  # Off-chain signer role
+│   │   ├── AllowlistedRole.sol        # KYC whitelist
+│   │   └── BlocklistedRole.sol        # AML blacklist
+│   ├── registry/
+│   │   ├── ERC1820Client.sol          # Helpers to call ERC-1820 registry
+│   │   └── ERC1820Implementer.sol     # Implements canImplementInterfaceForAddress
 │   └── mocks/                 # Test mocks and helpers
 ├── test/
-│   ├── ERC1400.test.js        # Integration tests for the full token
-│   ├── ERC1410.test.js        # Partition-specific tests
-│   ├── ERC1594.test.js        # Transfer restriction tests
-│   ├── ERC1643.test.js        # Document management tests
-│   ├── ERC1644.test.js        # Controller operation tests
+│   ├── ERC1400.test.js        # Core integration tests
+│   ├── ERC1400Partition.test.js # Partition-specific tests
+│   ├── ERC1400Issuance.test.js  # Issue / redeem lifecycle
+│   ├── ERC1400Certificate.test.js # Nonce-based and salt-based certificates
+│   ├── ERC1400Controller.test.js  # Force-transfer and force-redeem
+│   ├── ERC1400Document.test.js    # ERC-1643 document management
+│   ├── ERC1400Validator.test.js   # Allowlist, blocklist, pause tests
 │   └── helpers/               # Test utilities and fixtures
 ├── scripts/
 │   ├── deploy.js              # Deployment script
@@ -52,10 +62,24 @@ ERC--1400/
 ├── package.json
 ├── .solhint.json              # Solidity linter config
 ├── .prettierrc                # Code formatter config
+├── .env.example               # Environment variable template (no secrets)
 └── .github/
     └── workflows/
         └── ci.yml             # CI pipeline
 ```
+
+### Inheritance Hierarchy
+
+The recommended layered architecture (following ConsenSys UniversalToken):
+
+```
+ERC1400Raw               ← Base: certificates, controllers, ERC-1820 hooks, migration
+    └── ERC1400Partition  ← Partition/tranche system on top of Raw
+            └── ERC1400   ← Adds issuance/redemption + document management
+                    └── ERC1400ERC20  ← ERC-20 backwards compatibility (decimals = 18)
+```
+
+Top-level contract also inherits: `IERC20`, `IERC1400`, `Ownable`, `ERC1820Client`, `ERC1820Implementer`, `MinterRole`
 
 ---
 
@@ -212,11 +236,13 @@ npx hardhat verify --network <network-name> <contract-address> <constructor-args
 ### Security Practices
 
 - **Access control**: Use OpenZeppelin's `Ownable` or `AccessControl` for role management
-- **Reentrancy**: Follow checks-effects-interactions pattern; use `ReentrancyGuard` where needed
+- **Reentrancy**: Follow checks-effects-interactions pattern; use `ReentrancyGuard` on all hook-calling paths (ERC-1820 hooks introduce external call vectors)
 - **Transfer restrictions**: Always enforce compliance checks before executing transfers
-- **Controller operations**: Gate behind strict access control — controller can force-transfer/redeem but this power must be auditable
+- **Controller operations**: Gate behind strict access control — controllers MUST be multisig wallets, never EOAs
 - **Partition integrity**: Ensure `balanceOf` always equals the sum of all partition balances for a holder
 - **Document hashes**: Validate document hash matches content at URI (off-chain verification)
+- **Certificate replay prevention**: Track used nonces and salts per sender to prevent certificate replay attacks
+- **Certificate signer rotation**: Certificate signers should rotate keys and use short expiry windows
 
 ---
 
@@ -228,40 +254,100 @@ Partitions use `bytes32` keys (e.g., `keccak256("DEFAULT")`, `keccak256("LOCKED"
 
 ```solidity
 // Core partition storage
-mapping(bytes32 => mapping(address => uint256)) internal _balancesByPartition;
-mapping(address => bytes32[]) internal _partitionsOf;
-mapping(address => mapping(bytes32 => uint256)) internal _partitionIndexOf;
-mapping(bytes32 => uint256) internal _totalSupplyByPartition;
+bytes32[]                                          internal _totalPartitions;
+mapping(bytes32 => uint256)                        internal _indexOfTotalPartitions;    // 1-based
+mapping(bytes32 => uint256)                        internal _totalSupplyByPartition;
+mapping(address => bytes32[])                      internal _partitionsOf;
+mapping(address => mapping(bytes32 => uint256))    internal _indexOfPartitionsOf;       // 1-based
+mapping(address => mapping(bytes32 => uint256))    internal _balanceOfByPartition;
+bytes32[]                                          internal _defaultPartitions;
 ```
 
 Key invariant: `balanceOf(holder) == sum of balanceOfByPartition(p, holder) for all p in partitionsOf(holder)`
 
+**Swap-and-pop deletion**: When a partition's balance drops to zero, use the swap-and-pop pattern to remove it from the holder's array (swap with last element, then `pop()`). The 1-based index mapping enables O(1) lookups and deletions.
+
 ### Transfer Restriction Flow (ERC-1594)
 
 1. Caller invokes `canTransfer` / `canTransferByPartition` to check validity
-2. Returns EIP-1066 status code (`0x51` = success, `0x50` = failure, etc.) and a reason `bytes32`
+2. Returns EIP-1066 status code and a reason `bytes32`
 3. `_data` parameter supports off-chain authorization (e.g., signed transfer agent approval)
 4. Actual transfer functions enforce the same checks internally
+
+#### ERC-1066 Transfer Status Codes
+
+| Code | Meaning |
+|------|---------|
+| `0x50` | Transfer failure (generic) |
+| `0x51` | Transfer success |
+| `0x52` | Insufficient balance |
+| `0x53` | Insufficient allowance |
+| `0x54` | Transfers halted (contract paused) |
+| `0x55` | Funds locked (lockup period) |
+| `0x56` | Invalid sender |
+| `0x57` | Invalid receiver |
+| `0x58` | Invalid operator / transfer agent |
+| `0x5f` | Token meta or info |
+
+### Certificate Validation (Off-Chain Compliance)
+
+The `_data` parameter on transfer/issuance/redemption functions carries a compliance certificate — a signed message from a trusted off-chain compliance server. Two modes:
+
+**Nonce-based** (97 bytes appended to `_data`):
+- `bytes32 expirationTime` + `uint8 v` + `bytes32 r` + `bytes32 s`
+- Contract uses `ecrecover` to validate signer matches a registered `CertificateSignerRole`
+- Nonce incremented per sender after use
+
+**Salt-based** (129 bytes):
+- `bytes32 salt` + `bytes32 expirationTime` + `uint8 v` + `bytes32 r` + `bytes32 s`
+- Salt stored in `_usedCertificateSalt[signer][salt]` to prevent replay
+
+### ERC-1820 Registry Integration
+
+ERC-1400 uses the ERC-1820 pseudo-introspection registry (canonical address on all EVM chains) to:
+1. Register the token as implementing `ERC1400Token` and `ERC20Token` interfaces
+2. Discover pluggable hook contracts: `ERC1400TokensSender`, `ERC1400TokensRecipient`, `ERC1400TokensValidator`, `ERC1400TokensChecker`
+3. Enable upgradeable compliance policies without redeploying the core token
 
 ### Controller Model (ERC-1644)
 
 - A designated controller address can force-transfer and force-redeem tokens
 - `isControllable()` returns whether the token is currently controllable
 - Controller operations emit distinct events for auditability
-- Controller power should be revocable (transition to fully decentralized)
+- Once `isControllable()` returns `false`, this is permanent — controller functions MUST revert
+- Controller SHOULD be a multisig (Gnosis Safe), never a raw EOA
 
 ### ERC-20 Compatibility
 
 - `transfer`, `transferFrom`, `balanceOf`, `totalSupply`, `approve`, `allowance` all work as expected
-- Default partition is used for ERC-20 transfers
+- Default partition (set at construction) is used for ERC-20 style transfers
 - `Transfer` events are emitted for ERC-20 compatibility alongside partition-specific events
+- `decimals` is forced to `18` in the ERC-20 compatibility shim
+
+### Issuance Lifecycle
+
+- `isIssuable()` starts as `true`; once set to `false`, it MUST never return `true` again — issuance is permanently closed
+- This is a one-way latch, not a pause/unpause mechanism
+
+### Constructor Pattern
+
+```solidity
+constructor(
+    string memory name,
+    string memory symbol,
+    uint256 granularity,         // minimum divisible unit (1 = fully divisible at 18 decimals)
+    address[] memory controllers, // use Gnosis Safe addresses in production
+    bytes32[] memory defaultPartitions
+)
+```
 
 ---
 
 ## Reference Implementations
 
-- [ConsenSys/UniversalToken (ERC1400)](https://github.com/ConsenSys/ERC1400) — Mature reference implementation
-- [SecurityTokenStandard/EIP-Spec](https://github.com/SecurityTokenStandard/EIP-Spec) — Original EIP specification
+- [ConsenSys/UniversalToken (ERC1400)](https://github.com/ConsenSys/ERC1400) — Mature reference implementation (Truffle-based)
+- [taurushq-io/UniversalTokenERC1400](https://github.com/taurushq-io/UniversalTokenERC1400) — Hardhat-native fork of ConsenSys (Solidity 0.8.7)
+- [SecurityTokenStandard/EIP-Spec](https://github.com/SecurityTokenStandard/EIP-Spec) — Original EIP specification documents
 - [ethereum/EIPs #1411](https://github.com/ethereum/EIPs/issues/1411) — ERC-1400 proposal discussion
 
 ---
